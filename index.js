@@ -51,8 +51,8 @@ function validateConfig() {
     warnings.push('gameId tanımlanmamış - /aktiflik-sorgu komutu çalışmayacak');
   }
   
-  if (!config.adminRoleId) {
-    warnings.push('adminRoleId tanımlanmamış - yasaklama komutları çalışmayacak');
+  if (!config.adminRoleIds || !Array.isArray(config.adminRoleIds) || config.adminRoleIds.length === 0) {
+    warnings.push('adminRoleIds tanımlanmamış veya boş - yasaklama komutları çalışmayacak');
   }
   
   if (config.branchGroups) {
@@ -154,7 +154,7 @@ function generateVerificationCode() {
 function cleanExpiredVerifications() {
   const verifications = loadPendingVerifications();
   const now = Date.now();
-  const EXPIRY_TIME = 10 * 60 * 1000;
+  const EXPIRY_TIME = 10 * 60 * 1000; // 10 dakika
   
   let changed = false;
   for (const userId in verifications) {
@@ -281,7 +281,7 @@ const commands = [
           { name: 'HKK', value: 'HKK' }
         )
     )
-    .addStringOption(option =>
+    .addStringOption(optconstst =>
       option.setName('karar')
         .setDescription('Kabul veya Red')
         .setRequired(true)
@@ -326,6 +326,20 @@ const commands = [
       option.setName('sebep')
         .setDescription('Rütbe değişikliği sebebi')
         .setRequired(true)
+    ),
+  
+  new SlashCommandBuilder()
+    .setName('duyuru')
+    .setDescription('Botun bulunduğu tüm sunuculara duyuru yapar')
+    .addStringOption(option =>
+      option.setName('mesaj')
+        .setDescription('Duyuru mesajı')
+        .setRequired(true)
+    )
+    .addStringOption(option =>
+      option.setName('kanal_adi')
+        .setDescription('Duyurunun gönderileceği kanal adı (örn: duyurular, genel)')
+        .setRequired(true)
     )
 ].map(command => command.toJSON());
 
@@ -338,24 +352,42 @@ console.log('\n=== Bot Başlatılıyor ===\n');
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
-(async () => {
-  try {
-    console.log('Slash komutları kaydediliyor...');
-    await rest.put(
-      Routes.applicationCommands(DISCORD_CLIENT_ID),
-      { body: commands }
-    );
-    console.log('Slash komutları başarıyla kaydedildi');
-  } catch (error) {
-    console.error('Komut kaydı hatası:', error);
-    process.exit(1);
-  }
-})();
-
-client.on('clientReady', () => {
+client.on('clientReady', async () => {
   console.log(`${client.user.tag} olarak giriş yapıldı`);
   console.log(`Grup ID: ${config.groupId}`);
   console.log(`Oyun ID: ${config.gameId}`);
+  
+  console.log('\nEski global komutlar siliniyor...');
+  try {
+    await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), { body: [] });
+    console.log('✓ Global komutlar temizlendi');
+  } catch (error) {
+    console.error('✗ Global komut temizleme hatası:', error.message);
+  }
+  
+  console.log('\nSlash komutları kaydediliyor...');
+  
+  const guilds = client.guilds.cache;
+  let successCount = 0;
+  let failCount = 0;
+  
+  for (const [guildId, guild] of guilds) {
+    try {
+      await rest.put(
+        Routes.applicationGuildCommands(DISCORD_CLIENT_ID, guildId),
+        { body: commands }
+      );
+      console.log(`✓ ${guild.name} sunucusuna komutlar kaydedildi`);
+      successCount++;
+    } catch (error) {
+      console.error(`✗ ${guild.name} sunucusuna komut kaydı hatası:`, error.message);
+      failCount++;
+    }
+  }
+  
+  console.log(`\n=== Komut Kaydı Tamamlandı ===`);
+  console.log(`Başarılı: ${successCount} sunucu`);
+  console.log(`Başarısız: ${failCount} sunucu`);
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -401,6 +433,9 @@ client.on('interactionCreate', async (interaction) => {
       case 'branş-rütbe-değiştir':
         await handleBranchRankChange(interaction);
         break;
+      case 'duyuru':
+        await handleAnnouncement(interaction);
+        break;
     }
   } catch (error) {
     console.error(`Komut hatası (${commandName}):`, error);
@@ -440,6 +475,7 @@ async function checkRankPermissions(discordUserId, targetRank) {
     };
   }
 
+  // İzinli rütbe seviyelerini kontrol et
   if (config.allowedRanks && !config.allowedRanks.includes(managerRank.rank)) {
     return { 
       allowed: false, 
@@ -562,7 +598,7 @@ async function handleRankPromotion(interaction) {
   if (!roles) {
     return interaction.editReply('HATA: Grup rütbeleri alınamadı! Grup ID\'sini kontrol edin.');
   }
-  
+ c
   const sortedRoles = roles.sort((a, b) => a.rank - b.rank);
   const currentIndex = sortedRoles.findIndex(r => r.rank === currentRank.rank);
   
@@ -652,7 +688,7 @@ async function handleRankDemotion(interaction) {
 }
 
 async function handleBan(interaction) {
-  if (!interaction.member.roles.cache.has(config.adminRoleId)) {
+  if (!interaction.member.roles.cache.some(role => config.adminRoleIds.includes(role.id))) {
     return interaction.reply({ content: 'HATA: Bu komutu kullanma yetkiniz yok!', ephemeral: true });
   }
   
@@ -703,7 +739,7 @@ async function handleBan(interaction) {
 }
 
 async function handleUnban(interaction) {
-  if (!interaction.member.roles.cache.has(config.adminRoleId)) {
+  if (!interaction.member.roles.cache.some(role => config.adminRoleIds.includes(role.id))) {
     return interaction.reply({ content: 'HATA: Bu komutu kullanma yetkiniz yok!', ephemeral: true });
   }
   
@@ -950,6 +986,7 @@ async function handleRobloxLink(interaction) {
   
   const discordUserId = interaction.user.id;
   
+  // Hesap zaten bağlı mı kontrol et
   const existingLink = getLinkedRobloxUsername(discordUserId);
   if (existingLink) {
     return interaction.editReply(`HATA: Discord hesabınız zaten **${existingLink}** kullanıcısına bağlı! Hesabınızı değiştirmek için \`/roblox-değiştir\` komutunu kullanın.`);
@@ -967,16 +1004,20 @@ async function handleRobloxLink(interaction) {
     return interaction.editReply('HATA: Bu Roblox kullanıcısı grupta değil! Lütfen önce gruba katılın.');
   }
   
+  // Bekleyen doğrulama var mı kontrol et
   const pendingVerifications = loadPendingVerifications();
   const pendingVerification = pendingVerifications[discordUserId];
   
+  // Eğer bekleyen doğrulama varsa, kodu kontrol et
   if (pendingVerification) {
     const isVerified = await robloxAPI.verifyUserOwnership(userId, pendingVerification.code);
     
     if (isVerified) {
+      // Doğrulama başarılı - hesabı bağla
       const links = loadAccountLinks();
       links[discordUserId] = robloxNick;
       
+      // Bekleyen doğrulamayı sil
       delete pendingVerifications[discordUserId];
       savePendingVerifications(pendingVerifications);
       
@@ -999,6 +1040,7 @@ async function handleRobloxLink(interaction) {
     }
   }
   
+  // Yeni doğrulama kodu oluştur
   const verificationCode = generateVerificationCode();
   pendingVerifications[discordUserId] = {
     code: verificationCode,
@@ -1029,6 +1071,7 @@ async function handleRobloxChange(interaction) {
   
   const discordUserId = interaction.user.id;
   
+  // Hesap bağlı mı kontrol et
   const existingLink = getLinkedRobloxUsername(discordUserId);
   if (!existingLink) {
     return interaction.editReply('HATA: Discord hesabınız henüz bir Roblox hesabına bağlı değil! Önce `/roblox-bağla` komutunu kullanın.');
@@ -1046,17 +1089,21 @@ async function handleRobloxChange(interaction) {
     return interaction.editReply('HATA: Bu Roblox kullanıcısı grupta değil! Lütfen önce gruba katılın.');
   }
   
+  // Bekleyen doğrulama var mı kontrol et
   const pendingVerifications = loadPendingVerifications();
   const pendingVerification = pendingVerifications[discordUserId];
   
+  // Eğer bekleyen doğrulama varsa, kodu kontrol et
   if (pendingVerification) {
     const isVerified = await robloxAPI.verifyUserOwnership(userId, pendingVerification.code);
     
     if (isVerified) {
+      // Doğrulama başarılı - hesabı değiştir
       const links = loadAccountLinks();
       const oldUsername = links[discordUserId];
       links[discordUserId] = robloxNick;
       
+      // Bekleyen doğrulamayı sil
       delete pendingVerifications[discordUserId];
       savePendingVerifications(pendingVerifications);
       
@@ -1080,6 +1127,7 @@ async function handleRobloxChange(interaction) {
     }
   }
   
+  // Yeni doğrulama kodu oluştur
   const verificationCode = generateVerificationCode();
   pendingVerifications[discordUserId] = {
     code: verificationCode,
@@ -1103,6 +1151,62 @@ async function handleRobloxChange(interaction) {
     .setTimestamp();
   
   return interaction.editReply({ embeds: [verificationEmbed] });
+}
+
+async function handleAnnouncement(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+  
+  const mesaj = interaction.options.getString('mesaj');
+  const kanalAdi = interaction.options.getString('kanal_adi');
+  const member = interaction.member;
+  
+  let rolAdi;
+  if (interaction.user.username === 'emir_1881') {
+    rolAdi = 'İttifak Ordusu Bot Geliştiricisi';
+  } else {
+    const highestRole = member.roles.highest;
+    rolAdi = highestRole.name;
+  }
+  
+  const duyuruMetni = `${mesaj}\n\n-# ${interaction.user.username}, ${rolAdi}`;
+  
+  const guilds = client.guilds.cache;
+  let successCount = 0;
+  let failCount = 0;
+  const failedGuilds = [];
+  
+  for (const [guildId, guild] of guilds) {
+    try {
+      const kanal = guild.channels.cache.find(ch => 
+        ch.name.toLowerCase() === kanalAdi.toLowerCase() && ch.isTextBased()
+      );
+      
+      if (kanal) {
+        await kanal.send(duyuruMetni);
+        successCount++;
+      } else {
+        failCount++;
+        failedGuilds.push(`${guild.name} (kanal bulunamadı)`);
+      }
+    } catch (error) {
+      console.error(`${guild.name} sunucusunda duyuru hatası:`, error.message);
+      failCount++;
+      failedGuilds.push(`${guild.name} (${error.message})`);
+    }
+  }
+  
+  let sonucMesaji = `**Duyuru Gönderildi**\n\n`;
+  sonucMesaji += `Kanal: **${kanalAdi}**\n`;
+  sonucMesaji += `✓ Başarılı: ${successCount} sunucu\n`;
+  
+  if (failCount > 0) {
+    sonucMesaji += `✗ Başarısız: ${failCount} sunucu\n`;
+    if (failedGuilds.length > 0 && failedGuilds.length <= 10) {
+      sonucMesaji += `\nBaşarısız sunucular:\n${failedGuilds.map(g => `- ${g}`).join('\n')}`;
+    }
+  }
+  
+  await interaction.editReply(sonucMesaji);
 }
 
 client.login(DISCORD_TOKEN);
